@@ -52,6 +52,14 @@ func PortProfileBlocks(profiles []unifi.PortProfile, lanNetworkIDs []string) []R
 		addBool("port_isolation_enabled", p.Isolation, false)
 		addBool("stp_enabled", p.StpPortMode, true)
 		addBool("bpdu_guard_enabled", p.StpBpduGuardEnabled, false)
+		if p.StpEdgeState != nil {
+			switch *p.StpEdgeState {
+			case "enabled":
+				add("port_mode", HCLString("edge"), "")
+			case "disabled":
+				add("port_mode", HCLString("infrastructure"), "")
+			}
+		}
 		addBool("loop_protection_enabled", p.PortKeepaliveEnabled, false)
 		addBool("eee_enabled", p.EEEEnabled, false)
 		addBool("lldpmed_enabled", p.LldpmedEnabled, true)

@@ -148,6 +148,7 @@ func TestPortProfileAPIToModel_UIDefaults(t *testing.T) {
 	want.ID = types.StringValue("000000000000000000000100")
 	want.Site = types.StringValue("default")
 	want.NativeNetworkID = types.StringValue(testDefaultNetID)
+	want.PortMode = types.StringValue("infrastructure") // the UI default, stored as stp_edge_state = disabled
 	assert.Equal(t, want, got)
 }
 
