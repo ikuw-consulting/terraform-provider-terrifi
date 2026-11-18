@@ -1,211 +1,263 @@
 package provider
 
-// TODO(go-unifi): This file reads and writes a switch's port_overrides without
-// the SDK's unifi.DevicePortOverrides. That struct tags native_networkconf_id
-// (and most other fields) `omitempty`, so decoding and re-encoding an override
-// made in the UI with "Native VLAN: None" (native_networkconf_id = "") turns
-// it into an override with no native field, which the controller reads as the
-// Default network. Overrides are therefore kept as raw JSON objects and only
-// the keys this provider owns are touched.
-// Fix needed in SDK: drop `omitempty` from the override's string fields that
-// have meaningful empty values.
+// Local methods for reading a device's ports and writing its port_overrides,
+// using the local internal/unifi types rather than the go-unifi SDK — see
+// issue #157.
+//
+// port_overrides is a whole-array field: a PUT replaces every entry. Writes
+// are therefore a read-modify-write of the raw array that touches only the
+// managed ports (see mergePortOverrides).
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
-	"time"
 
-	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/alexklibisz/terrifi/internal/unifi"
 )
 
-// SwitchPort is one entry of a device's port_table: the live port as the
-// switch reports it, with the override (or profile) already applied.
-type SwitchPort struct {
-	PortIdx         int64    `json:"port_idx"`
-	Name            string   `json:"name"`
-	Media           string   `json:"media"`
-	Up              bool     `json:"up"`
-	Speed           int64    `json:"speed"`
-	IsUplink        bool     `json:"is_uplink"`
-	PoeCaps         int64    `json:"poe_caps"`
-	PoeMode         string   `json:"poe_mode"`
-	PortProfileID   string   `json:"portconf_id"`
-	NativeNetworkID *string  `json:"native_networkconf_id"`
-	TaggedVLANMgmt  string   `json:"tagged_vlan_mgmt"`
-	ExcludedIDs     []string `json:"excluded_networkconf_ids"`
-	Forward         string   `json:"forward"`
-	AggregatedBy    any      `json:"aggregated_by"`
-}
-
-// SwitchDevice is the part of a stat/device entry the port resources use.
-type SwitchDevice struct {
-	ID            string                       `json:"_id"`
-	MAC           string                       `json:"mac"`
-	Type          string                       `json:"type"`
-	Model         string                       `json:"model"`
-	Name          string                       `json:"name"`
-	Adopted       bool                         `json:"adopted"`
-	State         int64                        `json:"state"`
-	PortTable     []SwitchPort                 `json:"port_table"`
-	PortOverrides []map[string]json.RawMessage `json:"port_overrides"`
-}
-
-// overridePortIdx returns an override's port_idx, or -1 if it has none.
-func overridePortIdx(o map[string]json.RawMessage) int64 {
-	var idx int64 = -1
-	if raw, ok := o["port_idx"]; ok {
-		_ = json.Unmarshal(raw, &idx)
+// ListDevicePorts reads the ports of every device on the site, or of the
+// device with the given MAC.
+func (c *Client) ListDevicePorts(ctx context.Context, site, mac string) ([]unifi.DevicePorts, error) {
+	var resp struct {
+		Meta json.RawMessage     `json:"meta"`
+		Data []unifi.DevicePorts `json:"data"`
 	}
-	return idx
-}
-
-// overrideString returns a string key of an override, or "".
-func overrideString(o map[string]json.RawMessage, key string) string {
-	var s string
-	if raw, ok := o[key]; ok {
-		_ = json.Unmarshal(raw, &s)
+	url := fmt.Sprintf("%s%s/api/s/%s/stat/device", c.BaseURL, c.APIPath, site)
+	if mac != "" {
+		url += "/" + strings.ToLower(mac)
 	}
-	return s
-}
-
-// GetSwitchDevice fetches a device by MAC with its port table and raw port
-// overrides.
-func (c *Client) GetSwitchDevice(ctx context.Context, site, mac string) (*SwitchDevice, error) {
-	url := fmt.Sprintf("%s%s/api/s/%s/stat/device/%s", c.BaseURL, c.APIPath, site, strings.ToLower(mac))
-	var env struct {
-		Meta json.RawMessage `json:"meta"`
-		Data []SwitchDevice  `json:"data"`
-	}
-	if err := c.doV1Request(ctx, http.MethodGet, url, nil, &env); err != nil {
+	if err := c.doRequest(ctx, http.MethodGet, url, nil, &resp, false); err != nil {
+		if strings.Contains(err.Error(), "(404)") {
+			return nil, &unifi.NotFoundError{}
+		}
 		return nil, err
 	}
-	if err := checkV1Meta(env.Meta); err != nil {
+	if err := checkV1Meta(resp.Meta); err != nil {
 		return nil, err
 	}
-	if len(env.Data) == 0 {
+	return resp.Data, nil
+}
+
+// GetDevicePorts reads a device's ports by MAC.
+func (c *Client) GetDevicePorts(ctx context.Context, site, mac string) (*unifi.DevicePorts, error) {
+	devices, err := c.ListDevicePorts(ctx, site, mac)
+	if err != nil {
+		return nil, err
+	}
+	if len(devices) != 1 {
 		return nil, &unifi.NotFoundError{}
 	}
-	return &env.Data[0], nil
+	return &devices[0], nil
 }
 
-// SetPortOverrides replaces a device's whole port_overrides array. The
-// controller has no per-port write, so callers must send every override they
-// want to keep.
-func (c *Client) SetPortOverrides(ctx context.Context, site, deviceID string, overrides []map[string]json.RawMessage) error {
-	if overrides == nil {
-		overrides = []map[string]json.RawMessage{}
-	}
-	url := fmt.Sprintf("%s%s/api/s/%s/rest/device/%s", c.BaseURL, c.APIPath, site, deviceID)
-	var env struct {
+// PutPortOverrides replaces a device's port_overrides array. Only that field
+// is sent; the controller leaves the rest of the device as it is.
+func (c *Client) PutPortOverrides(ctx context.Context, site, deviceID string, overrides []map[string]json.RawMessage) error {
+	var resp struct {
 		Meta json.RawMessage `json:"meta"`
 	}
+	url := fmt.Sprintf("%s%s/api/s/%s/rest/device/%s", c.BaseURL, c.APIPath, site, deviceID)
 	body := map[string]any{"port_overrides": overrides}
-	if err := c.doV1Request(ctx, http.MethodPut, url, body, &env); err != nil {
+	if err := c.doPortProfileRequest(ctx, http.MethodPut, url, body, &resp); err != nil {
 		return err
 	}
-	return checkV1Meta(env.Meta)
+	return checkV1Meta(resp.Meta)
 }
 
-// Device states as reported in stat/device.
-const (
-	deviceStateConnected = 1
-)
+// portWant is the desired state of one managed port. nil fields are unset.
+type portWant struct {
+	Name            *string
+	ProfileID       *string
+	NativeNetworkID *string
+	TaggedVLANMode  *string
+	ResetVLAN       bool
+}
 
-// WaitForDeviceConnected polls until the device reports connected again after
-// a provision, or the timeout passes. A port change re-provisions the switch.
-func (c *Client) WaitForDeviceConnected(ctx context.Context, site, mac string, timeout time.Duration) (*SwitchDevice, error) {
-	deadline := time.Now().Add(timeout)
-	// Give the controller a moment to move the device out of "connected".
-	if err := sleepCtx(ctx, 2*time.Second); err != nil {
-		return nil, err
-	}
-	for {
-		// Polling must see fresh data even with response caching on.
-		if c.cache != nil {
-			c.cache.invalidateAll()
-		}
-		dev, err := c.GetSwitchDevice(ctx, site, mac)
+// mergePortOverrides applies want to the raw port_overrides array and returns
+// the new array. Ports not in want are left untouched. For each port in want:
+//
+//   - a nil *portWant removes the entire entry, restoring port defaults;
+//   - a profile replaces the whole entry with {port_idx, name, portconf_id},
+//     as the UI does: the profile then owns every setting, and a leftover
+//     poe_mode would shadow the profile's;
+//   - no profile removes portconf_id and keeps any inline settings;
+//   - no name removes the name (the controller shows "Port N");
+//   - inline VLAN settings, or a reset, replace every VLAN key (inlineVLANKeys)
+//     so an old voice VLAN or tagged list cannot outlive the new mode.
+//
+// An entry left with only port_idx is dropped: the port is back to default.
+// portconf_id is never sent as "" (the controller rejects it).
+func mergePortOverrides(current []map[string]json.RawMessage, want map[int64]*portWant) ([]map[string]json.RawMessage, error) {
+	byIdx := map[int64]map[string]json.RawMessage{}
+	out := []map[string]json.RawMessage{} // never null: the PUT must send []
+	for _, e := range current {
+		idx, err := portIdx(e)
 		if err != nil {
 			return nil, err
 		}
-		if dev.State == deviceStateConnected {
-			return dev, nil
+		if _, managed := want[idx]; !managed {
+			out = append(out, e)
+			continue
 		}
-		if time.Now().After(deadline) {
-			return dev, fmt.Errorf("device %s did not reconnect within %s (state %d)", mac, timeout, dev.State)
-		}
-		if err := sleepCtx(ctx, 3*time.Second); err != nil {
-			return nil, err
-		}
+		byIdx[idx] = e
 	}
-}
 
-// ListSwitchDevices returns every adopted device on the site that has switch
-// ports (switches, and gateways with a LAN switch).
-func (c *Client) ListSwitchDevices(ctx context.Context, site string) ([]SwitchDevice, error) {
-	url := fmt.Sprintf("%s%s/api/s/%s/stat/device", c.BaseURL, c.APIPath, site)
-	var env struct {
-		Meta json.RawMessage `json:"meta"`
-		Data []SwitchDevice  `json:"data"`
-	}
-	if err := c.doV1Request(ctx, http.MethodGet, url, nil, &env); err != nil {
-		return nil, err
-	}
-	if err := checkV1Meta(env.Meta); err != nil {
-		return nil, err
-	}
-	out := env.Data[:0]
-	for _, d := range env.Data {
-		if d.Adopted && len(d.PortTable) > 0 {
-			out = append(out, d)
+	for idx, w := range want {
+		if w == nil {
+			continue // Removing the override restores controller defaults.
+		}
+		e := byIdx[idx]
+		if e == nil {
+			e = map[string]json.RawMessage{}
+		}
+		if w.ProfileID != nil {
+			e = map[string]json.RawMessage{"portconf_id": rawString(*w.ProfileID)}
+		} else {
+			delete(e, "portconf_id")
+		}
+		if w.ResetVLAN || w.NativeNetworkID != nil {
+			for _, key := range inlineVLANKeys {
+				delete(e, key)
+			}
+		}
+		if w.NativeNetworkID != nil && w.TaggedVLANMode != nil {
+			e["native_networkconf_id"] = rawString(*w.NativeNetworkID)
+			mode, forward := "auto", "all"
+			if *w.TaggedVLANMode == "block_all" {
+				mode, forward = "block_all", "native"
+			}
+			e["tagged_vlan_mgmt"] = rawString(mode)
+			e["forward"] = rawString(forward)
+			e["excluded_networkconf_ids"] = json.RawMessage(`[]`)
+			e["setting_preference"] = rawString("manual")
+		}
+		delete(e, "name")
+		if w.Name != nil {
+			e["name"] = rawString(*w.Name)
+		}
+		e["port_idx"] = json.RawMessage(fmt.Sprint(idx))
+		if len(e) > 1 {
+			out = append(out, e)
 		}
 	}
+
+	slices.SortFunc(out, func(a, b map[string]json.RawMessage) int {
+		i, _ := portIdx(a)
+		j, _ := portIdx(b)
+		return cmp.Compare(i, j)
+	})
 	return out, nil
 }
 
-// PortConfig is one port as terrifi_device_port_overrides would import it.
-// Empty strings are unset attributes.
-type PortConfig struct {
-	Name             string
-	PortProfileID    string
-	NativeNetworkID  string
-	TaggedVLANMgmt   string
-	TaggedNetworkIDs []string
-	PoeMode          string
-	StpEdgeState     string
+// inlineVLANKeys are the port_overrides keys that together define a port's
+// inline VLAN configuration. setting_preference is included because inline
+// writes set it to manual; leaving it behind would keep a reset port from
+// returning to an empty override.
+var inlineVLANKeys = []string{
+	"native_networkconf_id", "tagged_vlan_mgmt", "excluded_networkconf_ids", "forward",
+	"voice_networkconf_id", "tagged_networkconf_ids", "setting_preference",
 }
 
-// PortConfigsForImport returns the ports an import of dev would take in,
-// keyed by port number.
-func PortConfigsForImport(dev *SwitchDevice, switchable []string) map[int64]PortConfig {
-	out := map[int64]PortConfig{}
-	for _, o := range dev.PortOverrides {
-		idx := overridePortIdx(o)
-		if idx < 0 {
+func portIdx(e map[string]json.RawMessage) (int64, error) {
+	idx, _, _, err := unifi.ParsePortOverride(e)
+	return idx, err
+}
+
+// portsFromOverrides reads name and portconf_id per port_idx.
+func portsFromOverrides(overrides []map[string]json.RawMessage) map[int64]portWant {
+	out := map[int64]portWant{}
+	for _, e := range overrides {
+		idx, name, profileID, err := unifi.ParsePortOverride(e)
+		if err != nil {
 			continue
 		}
-		var po portOverrideModel
-		readPortOverride(&po, o, switchable, true)
-		pc := PortConfig{
-			Name:            po.Name.ValueString(),
-			PortProfileID:   po.PortProfileID.ValueString(),
-			NativeNetworkID: po.NativeNetworkID.ValueString(),
-			TaggedVLANMgmt:  po.TaggedVLANMgmt.ValueString(),
-			PoeMode:         po.PoeMode.ValueString(),
-			StpEdgeState:    po.StpEdgeState.ValueString(),
+		var w portWant
+		if name != "" {
+			w.Name = &name
 		}
-		for _, v := range po.TaggedNetworkIDs.Elements() {
-			if s, ok := v.(types.String); ok {
-				pc.TaggedNetworkIDs = append(pc.TaggedNetworkIDs, s.ValueString())
-			}
+		if profileID != "" {
+			w.ProfileID = &profileID
 		}
-		sort.Strings(pc.TaggedNetworkIDs)
-		out[idx] = pc
+		native, mode := unifi.PortVLANSettings(e)
+		if native != "" {
+			w.NativeNetworkID = &native
+		}
+		if mode != "" {
+			w.TaggedVLANMode = &mode
+		}
+		out[idx] = w
 	}
 	return out
+}
+
+// checkPortsAssignable returns an error for a port the device doesn't have,
+// or a profile assigned to a gateway WAN port (becoming a WAN port strips the
+// profile, so it would never stick).
+func checkPortsAssignable(d *unifi.DevicePorts, want map[int64]*portWant) error {
+	for idx, w := range want {
+		if w == nil {
+			continue
+		}
+		i := slices.IndexFunc(d.PortTable, func(p unifi.DevicePort) bool { return p.PortIdx == idx })
+		if i < 0 {
+			return fmt.Errorf("device %s has no port %d", d.MAC, idx)
+		}
+		if d.Model == "USMINI" && w.ProfileID != nil {
+			return fmt.Errorf("device %s is a USW Flex Mini, which does not support custom port profiles; use inline VLAN settings", d.MAC)
+		}
+		if w.ProfileID == nil && w.NativeNetworkID == nil {
+			continue
+		}
+		for _, eo := range d.EthernetOverrides {
+			if eo.Ifname == d.PortTable[i].Ifname && eo.Networkgroup != "" && eo.Networkgroup != "LAN" {
+				return fmt.Errorf("port %d on device %s is a %s port; port VLAN settings and profiles only apply to LAN ports", idx, d.MAC, eo.Networkgroup)
+			}
+		}
+	}
+	return nil
+}
+
+func rawString(s string) json.RawMessage {
+	b, _ := json.Marshal(s)
+	return b
+}
+
+// validatePortNetworks checks references using local contracts. A Flex Mini
+// cannot combine an alternate native network with an allow-all trunk.
+func validatePortNetworks(d *unifi.DevicePorts, want map[int64]*portWant, networks []unifi.PortNetwork) error {
+	for idx, w := range want {
+		if w == nil || w.NativeNetworkID == nil {
+			continue
+		}
+		i := slices.IndexFunc(networks, func(n unifi.PortNetwork) bool {
+			return n.ID == *w.NativeNetworkID && (n.Purpose == "corporate" || n.Purpose == "guest" || n.Purpose == "vlan-only")
+		})
+		if i < 0 {
+			return fmt.Errorf("port %d: native network %q is not a LAN network on this site", idx, *w.NativeNetworkID)
+		}
+		if d.Model == "USMINI" && w.TaggedVLANMode != nil && *w.TaggedVLANMode == "allow_all" && networks[i].VLANEnabled {
+			return fmt.Errorf("port %d: USW Flex Mini supports allow_all only with the default native network; use block_all for a VLAN access port", idx)
+		}
+	}
+	return nil
+}
+
+func (c *Client) listPortNetworks(ctx context.Context, site string) ([]unifi.PortNetwork, error) {
+	var resp struct {
+		Meta json.RawMessage     `json:"meta"`
+		Data []unifi.PortNetwork `json:"data"`
+	}
+	url := fmt.Sprintf("%s%s/api/s/%s/rest/networkconf", c.BaseURL, c.APIPath, site)
+	if err := c.doRequest(ctx, http.MethodGet, url, nil, &resp, false); err != nil {
+		return nil, err
+	}
+	if err := checkV1Meta(resp.Meta); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
 }

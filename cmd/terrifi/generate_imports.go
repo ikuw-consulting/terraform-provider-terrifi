@@ -16,7 +16,7 @@ var validResourceTypes = []string{
 	"terrifi_client_device",
 	"terrifi_client_group",
 	"terrifi_device",
-	"terrifi_device_port_overrides",
+	"terrifi_device_ports",
 	"terrifi_dns_record",
 	"terrifi_firewall_group",
 	"terrifi_firewall_zone",
@@ -146,25 +146,6 @@ func generateResourceBlocks(ctx context.Context, client *provider.Client, site, 
 		}
 		blocks = generate.DeviceBlocks(devices)
 
-	case "terrifi_device_port_overrides":
-		devices, err := client.ListSwitchDevices(ctx, site)
-		if err != nil {
-			return nil, fmt.Errorf("listing switches: %w", err)
-		}
-		switchable, err := client.SwitchableNetworkIDs(ctx, site)
-		if err != nil {
-			return nil, fmt.Errorf("listing networks: %w", err)
-		}
-		switches := make([]generate.SwitchPorts, 0, len(devices))
-		for i := range devices {
-			sw := generate.SwitchPorts{MAC: devices[i].MAC, Name: devices[i].Name, Ports: map[int64]generate.SwitchPort{}}
-			for idx, pc := range provider.PortConfigsForImport(&devices[i], switchable) {
-				sw.Ports[idx] = generate.SwitchPort(pc)
-			}
-			switches = append(switches, sw)
-		}
-		blocks = generate.DevicePortOverridesBlocks(switches)
-
 	case "terrifi_dns_record":
 		records, err := client.ListDNSRecord(ctx, site)
 		if err != nil {
@@ -178,17 +159,6 @@ func generateResourceBlocks(ctx context.Context, client *provider.Client, site, 
 			return nil, fmt.Errorf("listing firewall groups: %w", err)
 		}
 		blocks = generate.FirewallGroupBlocks(groups)
-
-	case "terrifi_port_profile":
-		profiles, err := client.ListPortProfiles(ctx, site)
-		if err != nil {
-			return nil, fmt.Errorf("listing port profiles: %w", err)
-		}
-		switchable, err := client.SwitchableNetworkIDs(ctx, site)
-		if err != nil {
-			return nil, fmt.Errorf("listing networks: %w", err)
-		}
-		blocks = generate.PortProfileBlocks(portProfilesForGenerate(profiles, switchable))
 
 	case "terrifi_firewall_zone":
 		zones, err := client.ListFirewallZone(ctx, site)
@@ -227,6 +197,24 @@ func generateResourceBlocks(ctx context.Context, client *provider.Client, site, 
 		}
 		blocks = generate.NetworkBlocks(networks)
 
+	case "terrifi_device_ports":
+		devices, err := client.ListDevicePorts(ctx, site, "")
+		if err != nil {
+			return nil, fmt.Errorf("listing devices: %w", err)
+		}
+		blocks = generate.DevicePortsBlocks(devices)
+
+	case "terrifi_port_profile":
+		profiles, err := client.ListPortProfiles(ctx, site)
+		if err != nil {
+			return nil, fmt.Errorf("listing port profiles: %w", err)
+		}
+		lan, err := client.ListLANNetworkIDs(ctx, site)
+		if err != nil {
+			return nil, fmt.Errorf("listing networks: %w", err)
+		}
+		blocks = generate.PortProfileBlocks(profiles, lan)
+
 	case "terrifi_wlan":
 		wlans, err := client.ListWLAN(ctx, site)
 		if err != nil {
@@ -239,28 +227,4 @@ func generateResourceBlocks(ctx context.Context, client *provider.Client, site, 
 	}
 
 	return blocks, nil
-}
-
-// portProfilesForGenerate resolves each profile's exclusion list into the
-// tagged networks terrifi_port_profile declares.
-func portProfilesForGenerate(profiles []provider.PortProfile, switchable []string) []generate.PortProfile {
-	out := make([]generate.PortProfile, 0, len(profiles))
-	for _, p := range profiles {
-		g := generate.PortProfile{
-			ID:              p.ID,
-			Name:            p.Name,
-			NativeNetworkID: p.NativeNetworkID,
-			TaggedVLANMgmt:  p.TaggedVLANMgmt,
-			PoeMode:         p.PoeMode,
-			Isolation:       p.Isolation,
-		}
-		if p.TaggedVLANMgmt == "custom" {
-			g.TaggedNetworkIDs = provider.TaggedFromExcluded(switchable, p.ExcludedNetworkIDs, p.NativeNetworkID)
-		}
-		if p.PortSecurityEnabled {
-			g.PortSecurityMACAddresses = p.PortSecurityMACAddress
-		}
-		out = append(out, g)
-	}
-	return out
 }

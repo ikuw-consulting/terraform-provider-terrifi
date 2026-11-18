@@ -1,55 +1,35 @@
 package provider
 
-// TODO(go-unifi): This file bypasses the go-unifi SDK's PortProfile CRUD
-// (rest/portconf). The SDK's unifi.PortProfile tags native_networkconf_id and
-// excluded_networkconf_ids with `omitempty`, so two values the controller
-// treats as meaningful can never be sent:
+// Local CRUD methods for the v1 REST port profile endpoint
+// (/api/s/{site}/rest/portconf), using the local internal/unifi types rather
+// than the go-unifi SDK — see issue #157.
 //
-//  1. native_networkconf_id = "" is how the controller (and its UI, which uses
-//     the constant "" for the "None" option) stores "Native VLAN: None".
-//     Omitting the field instead makes the controller fall back to the Default
-//     network, so a profile meant to carry no untagged traffic silently puts
-//     every port on Default.
-//  2. excluded_networkconf_ids = [] is needed to clear a previous exclusion
-//     list on update; omitting it leaves the old list in place.
-//
-// Fix needed in SDK: drop `omitempty` from both fields (and make
-// TaggedVLANMgmt round-trip). Then this file can use the SDK methods.
+// Update is a read-modify-write on the raw controller object: the fields the
+// provider sets are overlaid, and every other key the controller returned
+// (link speed, port security, qos_profile, ...) is sent back untouched.
+// Create starts from portProfileUnmanagedDefaults instead. The controller
+// merges PUTs (keys left out keep their stored value), but sending the full
+// object keeps the update correct even if that changes.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
-	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/alexklibisz/terrifi/internal/unifi"
 )
 
-// PortProfile is the rest/portconf object, limited to the fields the
-// terrifi_port_profile resource manages plus the read-only ones it reports.
-// The JSON tags deliberately differ from the SDK's (see file-level TODO).
-type PortProfile struct {
-	ID                     string   `json:"_id,omitempty"`
-	Name                   string   `json:"name"`
-	NativeNetworkID        string   `json:"native_networkconf_id"`
-	TaggedVLANMgmt         string   `json:"tagged_vlan_mgmt"`
-	ExcludedNetworkIDs     []string `json:"excluded_networkconf_ids"`
-	PoeMode                string   `json:"poe_mode,omitempty"`
-	OpMode                 string   `json:"op_mode,omitempty"`
-	Isolation              bool     `json:"isolation"`
-	PortSecurityEnabled    bool     `json:"port_security_enabled"`
-	PortSecurityMACAddress []string `json:"port_security_mac_address"`
-	StpEdgeState           string   `json:"stp_edge_state,omitempty"`
-
-	// Read-only: the controller derives forward from tagged_vlan_mgmt and the
-	// native network, so it is never sent.
-	Forward string `json:"forward,omitempty"`
+type portProfileEnvelope struct {
+	Meta json.RawMessage     `json:"meta"`
+	Data []unifi.PortProfile `json:"data"`
 }
 
-// portProfileEnvelope is the v1 response envelope for rest/portconf.
-type portProfileEnvelope struct {
-	Meta json.RawMessage `json:"meta"`
-	Data []PortProfile   `json:"data"`
+type portProfileRawEnvelope struct {
+	Meta json.RawMessage              `json:"meta"`
+	Data []map[string]json.RawMessage `json:"data"`
 }
 
 func (c *Client) portProfileURL(site, id string) string {
@@ -60,106 +40,208 @@ func (c *Client) portProfileURL(site, id string) string {
 	return url
 }
 
-// sendPortProfile issues a POST or PUT and returns the stored profile. The
-// controller answers both with the stored object, which already reflects its
-// normalizations (e.g. custom with nothing tagged becomes block_all).
-func (c *Client) sendPortProfile(ctx context.Context, method, site string, p *PortProfile) (*PortProfile, error) {
-	body := *p
-	body.Forward = ""
-	if body.ExcludedNetworkIDs == nil {
-		body.ExcludedNetworkIDs = []string{}
+// doPortProfileRequest wraps doV2Request and maps HTTP 404 to the local
+// unifi.NotFoundError. (doV1Request maps it to the go-unifi SDK's type.)
+func (c *Client) doPortProfileRequest(ctx context.Context, method, url string, body, result any) error {
+	err := c.doV2Request(ctx, method, url, body, result)
+	if err != nil && strings.Contains(err.Error(), "(404)") {
+		return &unifi.NotFoundError{}
 	}
-	if body.PortSecurityMACAddress == nil {
-		body.PortSecurityMACAddress = []string{}
-	}
-
-	id := ""
-	if method == http.MethodPut {
-		id = p.ID
-	}
-
-	var env portProfileEnvelope
-	if err := c.doV1Request(ctx, method, c.portProfileURL(site, id), body, &env); err != nil {
-		return nil, err
-	}
-	if err := checkV1Meta(env.Meta); err != nil {
-		return nil, err
-	}
-	if len(env.Data) == 0 && method == http.MethodPut {
-		return c.GetPortProfile(ctx, site, p.ID)
-	}
-	if len(env.Data) != 1 {
-		return nil, fmt.Errorf("expected 1 port profile in response, got %d", len(env.Data))
-	}
-	return &env.Data[0], nil
+	return err
 }
 
-// CreatePortProfile creates a port profile (rest/portconf).
-func (c *Client) CreatePortProfile(ctx context.Context, site string, p *PortProfile) (*PortProfile, error) {
-	return c.sendPortProfile(ctx, http.MethodPost, site, p)
+// normalizePortProfile returns a copy with nil list fields replaced by empty
+// slices, so the controller receives an authoritative empty array when the
+// user removes every element.
+func normalizePortProfile(d *unifi.PortProfile) unifi.PortProfile {
+	p := *d
+	if p.ExcludedNetworkIDs == nil {
+		p.ExcludedNetworkIDs = []string{}
+	}
+	return p
 }
 
-// UpdatePortProfile updates a port profile. The v1 PUT merges the sent fields
-// into the stored object, so fields this resource does not manage are kept.
-func (c *Client) UpdatePortProfile(ctx context.Context, site string, p *PortProfile) (*PortProfile, error) {
-	return c.sendPortProfile(ctx, http.MethodPut, site, p)
+// portProfileUnmanagedDefaults returns the UI defaults (UniFi OS 5.1 /
+// Network 10.x) of settings the provider doesn't manage. Create sends them so
+// that a profile created by Terraform matches one created in the UI: the
+// provider forces the Advanced mode to manual, which makes these settings
+// apply, so they must not be left to whatever the controller stores for a
+// missing key.
+func portProfileUnmanagedDefaults() map[string]json.RawMessage {
+	return map[string]json.RawMessage{
+		"autoneg":                        json.RawMessage(`true`),
+		"full_duplex":                    json.RawMessage(`false`),
+		"voice_networkconf_id":           json.RawMessage(`""`),
+		"egress_rate_limit_kbps_enabled": json.RawMessage(`false`),
+		"stp_uplink":                     json.RawMessage(`false`),
+		"port_security_enabled":          json.RawMessage(`false`),
+		"port_security_mac_address":      json.RawMessage(`[]`),
+		"dot1x_ctrl":                     json.RawMessage(`"force_authorized"`),
+	}
 }
 
-// GetPortProfile reads one port profile by ID.
-func (c *Client) GetPortProfile(ctx context.Context, site, id string) (*PortProfile, error) {
-	var env portProfileEnvelope
-	if err := c.doV1Request(ctx, http.MethodGet, c.portProfileURL(site, id), nil, &env); err != nil {
+// ListPortProfiles returns every port profile on the site.
+func (c *Client) ListPortProfiles(ctx context.Context, site string) ([]unifi.PortProfile, error) {
+	return c.listPortProfiles(ctx, site, true)
+}
+
+func (c *Client) listPortProfiles(ctx context.Context, site string, useCached bool) ([]unifi.PortProfile, error) {
+	var resp portProfileEnvelope
+	if err := c.doRequest(ctx, http.MethodGet, c.portProfileURL(site, ""), nil, &resp, useCached); err != nil {
+		if strings.Contains(err.Error(), "(404)") {
+			return nil, &unifi.NotFoundError{}
+		}
 		return nil, err
 	}
-	if err := checkV1Meta(env.Meta); err != nil {
+	if err := checkV1Meta(resp.Meta); err != nil {
 		return nil, err
 	}
-	if len(env.Data) != 1 {
-		return nil, &unifi.NotFoundError{}
-	}
-	return &env.Data[0], nil
+	return resp.Data, nil
 }
 
-// ListPortProfiles lists every port profile on the site.
-func (c *Client) ListPortProfiles(ctx context.Context, site string) ([]PortProfile, error) {
-	var env portProfileEnvelope
-	if err := c.doV1Request(ctx, http.MethodGet, c.portProfileURL(site, ""), nil, &env); err != nil {
-		return nil, err
-	}
-	if err := checkV1Meta(env.Meta); err != nil {
-		return nil, err
-	}
-	return env.Data, nil
+// GetPortProfile reads a port profile by ID. It looks the ID up in the full
+// list rather than GETting /rest/portconf/{id}, so a missing profile is always
+// reported as unifi.NotFoundError regardless of how the controller signals an
+// unknown ID on the single-object endpoint.
+func (c *Client) GetPortProfile(ctx context.Context, site, id string) (*unifi.PortProfile, error) {
+	return c.getPortProfile(ctx, site, id, true)
 }
 
-// DeletePortProfile deletes a port profile.
-func (c *Client) DeletePortProfile(ctx context.Context, site, id string) error {
-	var env portProfileEnvelope
-	if err := c.doV1Request(ctx, http.MethodDelete, c.portProfileURL(site, id), struct{}{}, &env); err != nil {
-		return err
-	}
-	return checkV1Meta(env.Meta)
-}
-
-// SwitchableNetworkIDs returns the IDs of the networks a switch port can carry
-// as tagged VLANs: every LAN-side network (corporate, guest, vlan-only). The
-// controller stores trunks as an exclusion list over this set, so the
-// resource converts between "tagged" and "excluded" using it.
-func (c *Client) SwitchableNetworkIDs(ctx context.Context, site string) ([]string, error) {
-	networks, err := c.ListNetwork(ctx, site)
+func (c *Client) getPortProfile(ctx context.Context, site, id string, useCached bool) (*unifi.PortProfile, error) {
+	profiles, err := c.listPortProfiles(ctx, site, useCached)
 	if err != nil {
 		return nil, err
 	}
-	return switchableNetworkIDsFrom(networks), nil
+	for i := range profiles {
+		if profiles[i].ID == id {
+			return &profiles[i], nil
+		}
+	}
+	return nil, &unifi.NotFoundError{}
 }
 
-func switchableNetworkIDsFrom(networks []unifi.Network) []string {
-	ids := make([]string, 0, len(networks))
-	for _, n := range networks {
-		switch n.Purpose {
-		case "corporate", "guest", "vlan-only":
+// CreatePortProfile posts a new port profile, with the UI defaults for every
+// setting the provider doesn't manage.
+func (c *Client) CreatePortProfile(ctx context.Context, site string, d *unifi.PortProfile) (*unifi.PortProfile, error) {
+	payload, err := mergePortProfile(portProfileUnmanagedDefaults(), d)
+	if err != nil {
+		return nil, err
+	}
+	var resp portProfileEnvelope
+	if err := c.doPortProfileRequest(ctx, http.MethodPost, c.portProfileURL(site, ""), payload, &resp); err != nil {
+		return nil, err
+	}
+	if err := checkV1Meta(resp.Meta); err != nil {
+		return nil, err
+	}
+	if len(resp.Data) != 1 {
+		return nil, fmt.Errorf("creating port profile: controller returned %d objects, expected 1", len(resp.Data))
+	}
+	return &resp.Data[0], nil
+}
+
+// UpdatePortProfile replaces the managed fields of an existing port profile.
+// See the file-level comment for the read-modify-write rationale.
+func (c *Client) UpdatePortProfile(ctx context.Context, site string, d *unifi.PortProfile) (*unifi.PortProfile, error) {
+	var current portProfileRawEnvelope
+	if err := c.doPortProfileRequest(ctx, http.MethodGet, c.portProfileURL(site, ""), nil, &current); err != nil {
+		return nil, err
+	}
+	if err := checkV1Meta(current.Meta); err != nil {
+		return nil, err
+	}
+
+	var existing map[string]json.RawMessage
+	for _, obj := range current.Data {
+		var id string
+		if err := json.Unmarshal(obj["_id"], &id); err == nil && id == d.ID {
+			existing = obj
+			break
+		}
+	}
+	if existing == nil {
+		return nil, &unifi.NotFoundError{}
+	}
+
+	payload, err := mergePortProfile(existing, d)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp portProfileEnvelope
+	if err := c.doPortProfileRequest(ctx, http.MethodPut, c.portProfileURL(site, d.ID), payload, &resp); err != nil {
+		return nil, err
+	}
+	if err := checkV1Meta(resp.Meta); err != nil {
+		return nil, err
+	}
+	if len(resp.Data) == 1 {
+		return &resp.Data[0], nil
+	}
+	// The controller can return an empty data array for no-op updates. Fall
+	// back to a read instead of treating that as an error.
+	return c.GetPortProfile(ctx, site, d.ID)
+}
+
+// mergePortProfile overlays the fields of d onto the raw controller object.
+// Fields d leaves out (nil pointers, empty strings) keep their stored value;
+// settings that must be cleared are always sent with an explicit value
+// (false, "", []) instead.
+func mergePortProfile(existing map[string]json.RawMessage, d *unifi.PortProfile) (map[string]json.RawMessage, error) {
+	b, err := json.Marshal(normalizePortProfile(d))
+	if err != nil {
+		return nil, fmt.Errorf("marshaling port profile: %w", err)
+	}
+	if err := json.Unmarshal(b, &existing); err != nil {
+		return nil, fmt.Errorf("unmarshaling port profile: %w", err)
+	}
+	return existing, nil
+}
+
+// DeletePortProfile deletes a port profile. A profile that is already gone is
+// treated as deleted.
+func (c *Client) DeletePortProfile(ctx context.Context, site, id string) error {
+	var resp portProfileEnvelope
+	err := c.doPortProfileRequest(ctx, http.MethodDelete, c.portProfileURL(site, id), struct{}{}, &resp)
+	var nf *unifi.NotFoundError
+	if errors.As(err, &nf) {
+		return nil
+	}
+	if err != nil && strings.Contains(err.Error(), "api.err.ObjectReferredByDevice") {
+		return fmt.Errorf("the port profile is still assigned to a device port (the response names the device); "+
+			"remove it from terrifi_device_ports or the UniFi UI first: %w", err)
+	}
+	if err != nil {
+		return err
+	}
+	return checkV1Meta(resp.Meta)
+}
+
+// ListLANNetworkIDs returns the IDs of the site's LAN networks: the set the
+// controller's excluded_networkconf_ids deny-list is drawn from. Only
+// "corporate" networks have been observed in exclude lists; "guest" and
+// "vlan-only" are left out until verified (a documented limitation). It
+// decodes only _id and purpose, so it is independent of the full network type.
+func (c *Client) ListLANNetworkIDs(ctx context.Context, site string) ([]string, error) {
+	var resp struct {
+		Meta json.RawMessage `json:"meta"`
+		Data []struct {
+			ID      string `json:"_id"`
+			Purpose string `json:"purpose"`
+		} `json:"data"`
+	}
+	url := fmt.Sprintf("%s%s/api/s/%s/rest/networkconf", c.BaseURL, c.APIPath, site)
+	if err := c.doPortProfileRequest(ctx, http.MethodGet, url, nil, &resp); err != nil {
+		return nil, err
+	}
+	if err := checkV1Meta(resp.Meta); err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, n := range resp.Data {
+		if n.Purpose == "corporate" {
 			ids = append(ids, n.ID)
 		}
 	}
-	return ids
+	return ids, nil
 }

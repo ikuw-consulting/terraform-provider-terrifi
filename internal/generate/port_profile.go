@@ -1,22 +1,17 @@
 package generate
 
-// PortProfile is the subset of a rest/portconf object that maps onto
-// terrifi_port_profile, with tagged networks already resolved from the
-// controller's exclusion list.
-type PortProfile struct {
-	ID                       string
-	Name                     string
-	NativeNetworkID          string
-	TaggedVLANMgmt           string
-	TaggedNetworkIDs         []string
-	PoeMode                  string
-	Isolation                bool
-	PortSecurityMACAddresses []string
-}
+import (
+	"github.com/alexklibisz/terrifi/internal/unifi"
+)
 
-// PortProfileBlocks generates import + resource blocks for switch port
-// profiles. Attributes equal to the resource defaults are omitted.
-func PortProfileBlocks(profiles []PortProfile) []ResourceBlock {
+const networkIDComment = "TODO: reference the corresponding terrifi_network resource"
+
+// PortProfileBlocks generates import + resource blocks for port profiles.
+// lanNetworkIDs are the site's LAN networks, used to express a custom tagged
+// VLAN selection as tagged_network_ids (as the UI shows it) rather than the
+// stored deny-list. Attributes equal to the resource's schema defaults are
+// omitted. Settings the resource doesn't manage are not emitted.
+func PortProfileBlocks(profiles []unifi.PortProfile, lanNetworkIDs []string) []ResourceBlock {
 	blocks := make([]ResourceBlock, 0, len(profiles))
 	for _, p := range profiles {
 		block := ResourceBlock{
@@ -24,29 +19,69 @@ func PortProfileBlocks(profiles []PortProfile) []ResourceBlock {
 			ResourceName: ToTerraformName(p.Name),
 			ImportID:     p.ID,
 		}
+		add := func(key, value, comment string) {
+			block.Attributes = append(block.Attributes, Attr{Key: key, Value: value, Comment: comment})
+		}
+		addBool := func(key string, v *bool, def bool) {
+			if v != nil && *v != def {
+				add(key, HCLBool(*v), "")
+			}
+		}
 
-		block.Attributes = append(block.Attributes, Attr{Key: "name", Value: HCLString(p.Name)})
-		if p.NativeNetworkID != "" {
-			block.Attributes = append(block.Attributes, Attr{Key: "native_network_id", Value: HCLString(p.NativeNetworkID)})
+		add("name", HCLString(p.Name), "")
+
+		native := ""
+		if p.NativeNetworkID != nil {
+			native = *p.NativeNetworkID
 		}
-		mode := p.TaggedVLANMgmt
-		if mode == "" {
-			mode = "auto"
+		if native != "" {
+			add("native_network_id", HCLString(native), networkIDComment)
 		}
-		if mode != "block_all" {
-			block.Attributes = append(block.Attributes, Attr{Key: "tagged_vlan_mgmt", Value: HCLString(mode)})
+		if p.TaggedVLANMgmt != "" && p.TaggedVLANMgmt != "auto" {
+			add("tagged_vlan_mode", HCLString(unifi.TaggedVLANModeFromAPI(p.TaggedVLANMgmt)), "")
 		}
-		if mode == "custom" {
-			block.Attributes = append(block.Attributes, Attr{Key: "tagged_network_ids", Value: HCLStringList(p.TaggedNetworkIDs)})
+		if p.TaggedVLANMgmt == "custom" {
+			tagged := unifi.TaggedFromExcluded(lanNetworkIDs, p.ExcludedNetworkIDs, native)
+			add("tagged_network_ids", HCLStringList(tagged), networkIDComment)
 		}
-		if p.PoeMode != "" && p.PoeMode != "auto" {
-			block.Attributes = append(block.Attributes, Attr{Key: "poe_mode", Value: HCLString(p.PoeMode)})
+		if p.PoeMode != nil && *p.PoeMode != "" && *p.PoeMode != "auto" {
+			add("poe_mode", HCLString(*p.PoeMode), "")
 		}
-		if p.Isolation {
-			block.Attributes = append(block.Attributes, Attr{Key: "isolation", Value: HCLBool(true)})
+		addBool("flow_control_enabled", p.FlowControlEnabled, true)
+		addBool("ptp_enabled", p.PTPEnabled, true)
+		addBool("port_isolation_enabled", p.Isolation, false)
+		addBool("stp_enabled", p.StpPortMode, true)
+		addBool("bpdu_guard_enabled", p.StpBpduGuardEnabled, false)
+		addBool("loop_protection_enabled", p.PortKeepaliveEnabled, false)
+		addBool("eee_enabled", p.EEEEnabled, false)
+		addBool("lldpmed_enabled", p.LldpmedEnabled, true)
+		if p.LinkDebounceAuto != nil && !*p.LinkDebounceAuto {
+			ms := int64(0)
+			if p.LinkDebounce != nil {
+				ms = *p.LinkDebounce
+			}
+			add("link_debounce_ms", HCLInt64(ms), "")
 		}
-		if len(p.PortSecurityMACAddresses) > 0 {
-			block.Attributes = append(block.Attributes, Attr{Key: "port_security_mac_addresses", Value: HCLStringList(p.PortSecurityMACAddresses)})
+
+		if unit := unifi.StormControlTypeFromAPI(p.StormctrlType); unit != "percentage" {
+			add("storm_control_type", HCLString(unit), "")
+		}
+		for _, c := range []struct {
+			name        string
+			enabled     *bool
+			level, rate *int64
+		}{
+			{"broadcast", p.StormctrlBcastEnabled, p.StormctrlBcastLevel, p.StormctrlBcastRate},
+			{"multicast", p.StormctrlMcastEnabled, p.StormctrlMcastLevel, p.StormctrlMcastRate},
+			{"unknown_unicast", p.StormctrlUcastEnabled, p.StormctrlUcastLevel, p.StormctrlUcastRate},
+		} {
+			v := c.level
+			if p.StormctrlType == "rate" {
+				v = c.rate
+			}
+			if c.enabled != nil && *c.enabled && v != nil {
+				add("storm_control_"+c.name, HCLInt64(*v), "")
+			}
 		}
 
 		blocks = append(blocks, block)

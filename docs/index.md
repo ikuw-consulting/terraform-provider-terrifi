@@ -9,7 +9,7 @@ description: |-
 
 Terrifi is a Terraform provider and CLI for managing Ubiquiti UniFi network infrastructure. The provider communicates with the UniFi API to create, read, update, and delete network configuration such as DNS records, networks, WLANs, firewall zones, firewall policies, and client devices. The CLI provides tools for importing existing infrastructure into Terraform, verifying controller connectivity, and browsing the device fingerprint database.
 
-We leverage hardware-in-the-loop testing to ensure that all resources are fully functional with real UniFi hardware.
+Acceptance tests run against two targets: Simulated (a Docker controller configured for simulation mode) and Hardware-in-the-loop (a controller connected to UniFi hardware). Each resource and data-source page documents its [validation coverage](guides/validation-coverage.md) separately for these two targets.
 
 ## Example Usage
 
@@ -123,13 +123,13 @@ Supported resource types:
 |---|---|---|
 | `terrifi_client_device` | Client devices (aliases, fixed IPs, etc.) | [client_device](resources/client_device.md) |
 | `terrifi_client_group` | Client groups | [client_group](resources/client_group.md) |
+| `terrifi_device_ports` | Port profile and name assignments on device ports | [device_ports](resources/device_ports.md) |
 | `terrifi_dns_record` | DNS records | [dns_record](resources/dns_record.md) |
 | `terrifi_firewall_zone` | Firewall zones | [firewall_zone](resources/firewall_zone.md) |
 | `terrifi_firewall_policy` | Firewall policies | [firewall_policy](resources/firewall_policy.md) |
 | `terrifi_firewall_policy_order` | Firewall policy ordering | [firewall_policy_order](resources/firewall_policy_order.md) |
 | `terrifi_network` | Networks | [network](resources/network.md) |
 | `terrifi_port_profile` | Switch port profiles | [port_profile](resources/port_profile.md) |
-| `terrifi_device_port_overrides` | Per-port settings of a switch | [device_port_overrides](resources/device_port_overrides.md) |
 | `terrifi_wlan` | Wireless networks | [wlan](resources/wlan.md) |
 
 Example:
