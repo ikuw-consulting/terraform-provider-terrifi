@@ -48,6 +48,8 @@ type devicePortsResourceModel struct {
 	Site      types.String               `tfsdk:"site"`
 	DeviceMAC types.String               `tfsdk:"device_mac"`
 	Ports     map[string]devicePortModel `tfsdk:"ports"`
+
+	DefaultPortProfileID types.String `tfsdk:"default_port_profile_id"`
 }
 
 type devicePortModel struct {
@@ -104,6 +106,18 @@ func (r *devicePortsResource) Schema(
 				Validators: []validator.String{
 					stringvalidator.RegexMatches(macRegexp, "must be a MAC address like aa:bb:cc:dd:ee:ff"),
 				},
+			},
+
+			"default_port_profile_id": schema.StringAttribute{
+				MarkdownDescription: "The ID of a `terrifi_port_profile` assigned to every port that is not listed in `ports`, " +
+					"except the device's current uplink and gateway WAN ports. Point it at a locked-down profile " +
+					"(no native network, `tagged_vlan_mode = \"block_all\"`) to make a switch deny-by-default: only listed ports " +
+					"carry traffic. List the ports that feed other switches and access points first: only the device's own " +
+					"uplink is skipped. Existing port names on unlisted ports are kept. Removing this attribute, or " +
+					"destroying the resource, releases the unlisted ports that still carry the profile back to the " +
+					"controller default.",
+				Optional:   true,
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
 			},
 
 			"ports": schema.MapNestedAttribute{
@@ -181,7 +195,7 @@ func (r *devicePortsResource) Create(
 		return
 	}
 	plan.Site = types.StringValue(r.client.SiteOrDefault(plan.Site))
-	id, err := r.write(ctx, plan.Site.ValueString(), plan.DeviceMAC.ValueString(), portWants(plan.Ports, nil))
+	id, err := r.write(ctx, plan.Site.ValueString(), plan.DeviceMAC.ValueString(), portWants(plan.Ports, nil), plan.DefaultPortProfileID.ValueString(), "")
 	if err != nil {
 		resp.Diagnostics.AddError("Error Assigning Device Ports", err.Error())
 		return
@@ -225,6 +239,7 @@ func (r *devicePortsResource) Read(
 		resp.Diagnostics.Append(warnings...)
 	}
 	state.Ports = portsToModel(portsFromOverrides(overrides), state.Ports)
+	state.DefaultPortProfileID = observedDefaultProfile(d, state.Ports, state.DefaultPortProfileID)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -245,7 +260,8 @@ func (r *devicePortsResource) Update(
 		return
 	}
 	plan.Site = state.Site
-	id, err := r.write(ctx, plan.Site.ValueString(), plan.DeviceMAC.ValueString(), portWants(plan.Ports, state.Ports))
+	id, err := r.write(ctx, plan.Site.ValueString(), plan.DeviceMAC.ValueString(), portWants(plan.Ports, state.Ports),
+		plan.DefaultPortProfileID.ValueString(), state.DefaultPortProfileID.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Error Assigning Device Ports", err.Error())
 		return
@@ -267,7 +283,7 @@ func (r *devicePortsResource) Delete(
 		return
 	}
 
-	_, err := r.write(ctx, r.client.SiteOrDefault(state.Site), state.DeviceMAC.ValueString(), portWants(nil, state.Ports))
+	_, err := r.write(ctx, r.client.SiteOrDefault(state.Site), state.DeviceMAC.ValueString(), portWants(nil, state.Ports), "", state.DefaultPortProfileID.ValueString())
 	var nf *unifi.NotFoundError
 	if err != nil && !errors.As(err, &nf) {
 		resp.Diagnostics.AddError("Error Releasing Device Ports", err.Error())
@@ -297,11 +313,14 @@ func (r *devicePortsResource) ImportState(
 
 // write merges want into the device's port_overrides and PUTs the result. It
 // returns the device ID.
-func (r *devicePortsResource) write(ctx context.Context, site, mac string, want map[int64]*portWant) (string, error) {
+// defaultProfile is assigned to every eligible unlisted port; priorDefault is
+// the one being replaced or removed (see applyDefaultProfile).
+func (r *devicePortsResource) write(ctx context.Context, site, mac string, want map[int64]*portWant, defaultProfile, priorDefault string) (string, error) {
 	d, err := r.client.GetDevicePorts(ctx, site, mac)
 	if err != nil {
 		return "", fmt.Errorf("reading device %s: %w", mac, err)
 	}
+	applyDefaultProfile(d, want, defaultProfile, priorDefault)
 	if len(want) == 0 {
 		return d.ID, nil
 	}

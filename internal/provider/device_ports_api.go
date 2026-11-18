@@ -15,7 +15,10 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/alexklibisz/terrifi/internal/unifi"
 )
@@ -260,4 +263,71 @@ func (c *Client) listPortNetworks(ctx context.Context, site string) ([]unifi.Por
 		return nil, err
 	}
 	return resp.Data, nil
+}
+
+// defaultProfileEligible reports whether a port takes the default profile: not
+// the device's current uplink and, on a gateway, not a WAN interface.
+func defaultProfileEligible(d *unifi.DevicePorts, p unifi.DevicePort) bool {
+	if p.IsUplink {
+		return false
+	}
+	for _, eo := range d.EthernetOverrides {
+		if eo.Ifname == p.Ifname && eo.Networkgroup != "" && eo.Networkgroup != "LAN" {
+			return false
+		}
+	}
+	return true
+}
+
+// applyDefaultProfile adds the default profile's changes to want. Ports in want
+// with a non-nil entry are listed in the config and are never touched. Every
+// other eligible port:
+//
+//   - gets def, keeping its current name, when def is set. A port removed from
+//     the config (a nil entry) also loses its name, as it would on release;
+//   - is released (profile removed, name kept) when def is empty and the port
+//     still carries priorDef, so removing the default undoes only what it set.
+func applyDefaultProfile(d *unifi.DevicePorts, want map[int64]*portWant, def, priorDef string) {
+	if def == "" && priorDef == "" {
+		return
+	}
+	current := portsFromOverrides(d.PortOverrides)
+	for _, p := range d.PortTable {
+		if want[p.PortIdx] != nil || !defaultProfileEligible(d, p) {
+			continue
+		}
+		cur := current[p.PortIdx]
+		_, removed := want[p.PortIdx]
+		if removed && def == "" {
+			continue // already released outright
+		}
+		name := cur.Name
+		if removed {
+			name = nil
+		}
+		switch {
+		case def != "":
+			want[p.PortIdx] = &portWant{ProfileID: &def, Name: name}
+		case cur.ProfileID != nil && *cur.ProfileID == priorDef:
+			want[p.PortIdx] = &portWant{Name: name}
+		}
+	}
+}
+
+// observedDefaultProfile reports def only while every eligible unlisted port
+// still carries it, so drift on any of them plans an update.
+func observedDefaultProfile(d *unifi.DevicePorts, listed map[string]devicePortModel, def types.String) types.String {
+	if def.IsNull() || def.IsUnknown() {
+		return def
+	}
+	current := portsFromOverrides(d.PortOverrides)
+	for _, p := range d.PortTable {
+		if _, ok := listed[strconv.FormatInt(p.PortIdx, 10)]; ok || !defaultProfileEligible(d, p) {
+			continue
+		}
+		if cur := current[p.PortIdx]; cur.ProfileID == nil || *cur.ProfileID != def.ValueString() {
+			return types.StringNull()
+		}
+	}
+	return def
 }
