@@ -72,6 +72,7 @@ type portProfileResourceModel struct {
 	PTPEnabled                 types.Bool   `tfsdk:"ptp_enabled"`
 	StpEnabled                 types.Bool   `tfsdk:"stp_enabled"`
 	BpduGuardEnabled           types.Bool   `tfsdk:"bpdu_guard_enabled"`
+	PortMode                   types.String `tfsdk:"port_mode"`
 	LoopProtectionEnabled      types.Bool   `tfsdk:"loop_protection_enabled"`
 	EEEEnabled                 types.Bool   `tfsdk:"eee_enabled"`
 	LinkDebounceMs             types.Int64  `tfsdk:"link_debounce_ms"`
@@ -188,6 +189,18 @@ func (r *portProfileResource) Schema(
 			"port_isolation_enabled": boolAttr("Whether port isolation is enabled.", false),
 			"stp_enabled":            boolAttr("Whether spanning tree (STP) is enabled.", portProfileDefaultStpEnabled),
 			"bpdu_guard_enabled":     boolAttr("Whether BPDU guard is enabled.", false),
+			"port_mode": schema.StringAttribute{
+				MarkdownDescription: "The UI's Port Mode: `edge` for ports that connect end devices (the port " +
+					"forwards immediately and is never an STP path to the root), `infrastructure` for ports that " +
+					"connect other switches or access points. Unset leaves the controller's current value untouched " +
+					"(the UI defaults new profiles to `infrastructure`).",
+				Optional: true,
+				Computed: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+				Validators: []validator.String{stringvalidator.OneOf("edge", "infrastructure")},
+			},
 			"loop_protection_enabled": boolAttr("Whether non-STP loop protection is enabled "+
 				"(`port_keepalive_enabled` in the API).", false),
 			"eee_enabled":     boolAttr("Whether Energy Efficient Ethernet is enabled.", false),
@@ -637,6 +650,7 @@ func (r *portProfileResource) modelToAPI(ctx context.Context, m *portProfileReso
 		PTPEnabled:           ptrTo(m.PTPEnabled.ValueBool()),
 		StpPortMode:          ptrTo(m.StpEnabled.ValueBool()),
 		StpBpduGuardEnabled:  ptrTo(m.BpduGuardEnabled.ValueBool()),
+		StpEdgeState:         portModeToAPI(m.PortMode),
 		PortKeepaliveEnabled: ptrTo(m.LoopProtectionEnabled.ValueBool()),
 		EEEEnabled:           ptrTo(m.EEEEnabled.ValueBool()),
 
@@ -742,6 +756,7 @@ func (r *portProfileResource) apiToModel(p *unifi.PortProfile, m *portProfileRes
 	m.PTPEnabled = types.BoolValue(boolOr(p.PTPEnabled, portProfileDefaultPTP))
 	m.StpEnabled = types.BoolValue(boolOr(p.StpPortMode, portProfileDefaultStpEnabled))
 	m.BpduGuardEnabled = types.BoolValue(boolOr(p.StpBpduGuardEnabled, false))
+	m.PortMode = portModeFromAPI(p.StpEdgeState)
 	m.LoopProtectionEnabled = types.BoolValue(boolOr(p.PortKeepaliveEnabled, false))
 	m.EEEEnabled = types.BoolValue(boolOr(p.EEEEnabled, false))
 
@@ -765,6 +780,31 @@ func (r *portProfileResource) apiToModel(p *unifi.PortProfile, m *portProfileRes
 // ---------------------------------------------------------------------------
 // Small conversion helpers
 // ---------------------------------------------------------------------------
+
+// portModeToAPI maps port_mode (edge|infrastructure) to stp_edge_state
+// (enabled|disabled). Null is omitted so the controller keeps its value.
+func portModeToAPI(v types.String) *string {
+	switch v.ValueString() {
+	case "edge":
+		return ptrTo("enabled")
+	case "infrastructure":
+		return ptrTo("disabled")
+	}
+	return nil
+}
+
+func portModeFromAPI(v *string) types.String {
+	if v == nil {
+		return types.StringNull()
+	}
+	switch *v {
+	case "enabled":
+		return types.StringValue("edge")
+	case "disabled":
+		return types.StringValue("infrastructure")
+	}
+	return types.StringNull()
+}
 
 func ptrTo[T any](v T) *T { return &v }
 

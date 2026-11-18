@@ -36,13 +36,15 @@ type PortProfile struct {
 	// deny-list: every LAN network except the tagged and native ones.
 	ExcludedNetworkIDs []string `json:"excluded_networkconf_ids"`
 
-	PoeMode              *string `json:"poe_mode,omitempty"` // auto|off (UI "Auto PoE")
-	Isolation            *bool   `json:"isolation,omitempty"`
-	LldpmedEnabled       *bool   `json:"lldpmed_enabled,omitempty"`
-	FlowControlEnabled   *bool   `json:"flow_control_enabled,omitempty"`
-	PTPEnabled           *bool   `json:"precision_time_protocol_enabled,omitempty"`
-	StpPortMode          *bool   `json:"stp_port_mode,omitempty"`
-	StpBpduGuardEnabled  *bool   `json:"stp_bpdu_guard_enabled,omitempty"`
+	PoeMode             *string `json:"poe_mode,omitempty"` // auto|off (UI "Auto PoE")
+	Isolation           *bool   `json:"isolation,omitempty"`
+	LldpmedEnabled      *bool   `json:"lldpmed_enabled,omitempty"`
+	FlowControlEnabled  *bool   `json:"flow_control_enabled,omitempty"`
+	PTPEnabled          *bool   `json:"precision_time_protocol_enabled,omitempty"`
+	StpPortMode         *bool   `json:"stp_port_mode,omitempty"`
+	StpBpduGuardEnabled *bool   `json:"stp_bpdu_guard_enabled,omitempty"`
+	// UI "Port Mode": "enabled" is Edge, "disabled" is Infrastructure.
+	StpEdgeState         *string `json:"stp_edge_state,omitempty"`
 	PortKeepaliveEnabled *bool   `json:"port_keepalive_enabled,omitempty"` // UI "Non-STP loop protection"
 	EEEEnabled           *bool   `json:"eee_enabled,omitempty"`
 	// Auto ignores the stored debounce; Off uses 0; Custom uses 100–5000 ms.

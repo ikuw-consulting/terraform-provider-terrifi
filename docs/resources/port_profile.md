@@ -103,6 +103,7 @@ Terraform manages these settings even when omitted and corrects out-of-band chan
 
 - `stp_enabled` (Boolean) — Whether spanning tree is enabled. Default: `true`. Disabling STP removes its protection against switching loops.
 - `bpdu_guard_enabled` (Boolean) — Whether BPDU guard is enabled. Default: `false`.
+- `port_mode` (String) — The UI's Port Mode: `edge` for ports that connect end devices (the port forwards immediately and is never an STP path to the root), `infrastructure` for ports that connect other switches or access points. Unset leaves the controller's current value untouched (the UI defaults new profiles to `infrastructure`).
 - `loop_protection_enabled` (Boolean) — Whether non-STP loop protection is enabled. Default: `false`.
 
 #### Storm control
@@ -160,6 +161,8 @@ See [validation coverage](../guides/validation-coverage.md) for definitions and 
 | `stp_enabled` | Omit to reset to `true` | ✅ | ✅ |
 | `bpdu_guard_enabled` | Set to `true` | ✅ | ✅ |
 | `bpdu_guard_enabled` | Omit to reset to `false` | ✅ | ✅ |
+| `port_mode` | Set to `edge` and `infrastructure` | ❌ | ❌ |
+| `port_mode` | Omit to leave the controller's value untouched | ❌ | ❌ |
 | `loop_protection_enabled` | Set to `true` | ✅ | ✅ |
 | `loop_protection_enabled` | Omit to reset to `false` | ✅ | ✅ |
 | `storm_control_type` | Change between percentage and packets per second | ✅ | ✅ |

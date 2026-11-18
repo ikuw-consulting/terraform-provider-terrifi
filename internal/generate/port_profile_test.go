@@ -157,3 +157,13 @@ func TestPortProfileBlocks_AdvancedDefaultsOmitted(t *testing.T) {
 	p.StormctrlType, p.StormctrlBcastEnabled, p.StormctrlBcastLevel = "level", ptr(false), ptr(int64(37))
 	assert.Equal(t, map[string]string{"name": `"Defaults"`, "native_network_id": `"net-default"`}, attrMapFromBlock(PortProfileBlocks([]unifi.PortProfile{p}, nil)[0]))
 }
+
+func TestPortProfileBlocks_PortMode(t *testing.T) {
+	for state, want := range map[string]string{"enabled": `"edge"`, "disabled": `"infrastructure"`} {
+		p := unifi.PortProfile{Name: "Mode", StpEdgeState: ptr(state)}
+		blocks := PortProfileBlocks([]unifi.PortProfile{p}, nil)
+		assert.Equal(t, want, attrMapFromBlock(blocks[0])["port_mode"], state)
+	}
+	blocks := PortProfileBlocks([]unifi.PortProfile{{Name: "Unset"}}, nil)
+	assert.NotContains(t, attrMapFromBlock(blocks[0]), "port_mode")
+}

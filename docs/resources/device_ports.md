@@ -41,7 +41,12 @@ resource "terrifi_device_ports" "core_switch" {
 ### Required
 
 - `device_mac` (String) The MAC address of the adopted device (e.g. `aa:bb:cc:dd:ee:ff`). Changing it replaces this resource.
-- `ports` (Attributes Map) The managed ports, keyed by port number (`"1"`, `"2"`, ...). (see [below for nested schema](#nestedatt--ports))
+- `ports` (Attributes Map) The managed ports, keyed by port number (`"1"`, `"2"`, ...).
+The reserved key `"*"` sets the profile or inline VLAN settings of every port that is not listed, except the device's current uplink and gateway WAN ports; it does not accept `name`.
+Point it at a locked-down profile (no native network, `tagged_vlan_mode = "block_all"`) to make a switch deny-by-default: only listed ports carry traffic.
+List the ports that feed other switches and access points explicitly: only the device's own uplink is skipped.
+Existing names on unlisted ports are kept.
+Removing `"*"`, or destroying the resource, releases the unlisted ports that still carry its settings back to the controller default. (see [below for nested schema](#nestedatt--ports))
 
 ### Optional
 
@@ -75,6 +80,7 @@ The current Simulated target exposes no adopted devices or usable switch ports, 
 | `ports.<port>.native_network_id` | Change the inline native network | ◻️ | ✅ |
 | `ports.<port>.tagged_vlan_mode` | Set inline mode to `block_all` | ◻️ | ✅ |
 | `ports.<port>.tagged_vlan_mode` | Set inline mode to `allow_all` | ◻️ | ✅ |
+| `ports.*` | Assign a profile to every unlisted port, repair drift, change, and remove | ◻️ | ◻️ |
 | `ports.<port>.port_profile_id` | Assign a custom profile | ◻️ | ◻️ |
 | `ports.<port>.port_profile_id` | Replace the assigned profile | ◻️ | ◻️ |
 | `ports.<port>.port_profile_id` | Repair an out-of-band detachment | ◻️ | ◻️ |
@@ -82,6 +88,27 @@ The current Simulated target exposes no adopted devices or usable switch ports, 
 Inline VLAN tests use reserved Flex Mini ports 4 and 5 on the Hardware-in-the-loop target and skip on the current Simulated target. Custom-profile assignment tests skip on the HIL USW Flex Mini because it does not support custom profiles. Removing only a configured name is also checked in that skipped profile lifecycle test; releasing an entire port is covered separately on hardware.
 
 Evidence: [device_ports_resource_test.go](https://github.com/alexklibisz/terraform-provider-terrifi/blob/main/internal/provider/device_ports_resource_test.go), [device_ports_inline_test.go](https://github.com/alexklibisz/terraform-provider-terrifi/blob/main/internal/provider/device_ports_inline_test.go).
+
+### Deny-by-default switch
+
+```terraform
+resource "terrifi_port_profile" "locked" {
+  name     = "locked"
+  poe_mode = "off"
+  # No native network and tagged_vlan_mode defaults to allow_all: block it.
+  tagged_vlan_mode = "block_all"
+}
+
+resource "terrifi_device_ports" "access_switch" {
+  device_mac = "aa:bb:cc:dd:ee:ff"
+
+  ports = {
+    # Every port not listed here, except the uplink, carries nothing.
+    "*" = { port_profile_id = terrifi_port_profile.locked.id }
+    "1" = { name = "Access point", port_profile_id = terrifi_port_profile.trunk.id }
+  }
+}
+```
 
 ## Import
 
