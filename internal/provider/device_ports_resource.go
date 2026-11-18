@@ -48,9 +48,11 @@ type devicePortsResourceModel struct {
 	Site      types.String               `tfsdk:"site"`
 	DeviceMAC types.String               `tfsdk:"device_mac"`
 	Ports     map[string]devicePortModel `tfsdk:"ports"`
-
-	DefaultPortProfileID types.String `tfsdk:"default_port_profile_id"`
 }
+
+// defaultPortKey is the reserved ports key whose settings apply to every port
+// that is not listed.
+const defaultPortKey = "*"
 
 type devicePortModel struct {
 	Name            types.String `tfsdk:"name"`
@@ -108,24 +110,18 @@ func (r *devicePortsResource) Schema(
 				},
 			},
 
-			"default_port_profile_id": schema.StringAttribute{
-				MarkdownDescription: "The ID of a `terrifi_port_profile` assigned to every port that is not listed in `ports`, " +
-					"except the device's current uplink and gateway WAN ports. Point it at a locked-down profile " +
-					"(no native network, `tagged_vlan_mode = \"block_all\"`) to make a switch deny-by-default: only listed ports " +
-					"carry traffic. List the ports that feed other switches and access points first: only the device's own " +
-					"uplink is skipped. Existing port names on unlisted ports are kept. Removing this attribute, or " +
-					"destroying the resource, releases the unlisted ports that still carry the profile back to the " +
-					"controller default.",
-				Optional:   true,
-				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
-			},
-
 			"ports": schema.MapNestedAttribute{
 				MarkdownDescription: "The managed ports, keyed by port number (`\"1\"`, `\"2\"`, ...). " +
-					"Removing a port from this map clears its current port override and restores controller defaults.",
+					"Removing a port from this map clears its current port override and restores controller defaults. " +
+					"The reserved key `\"*\"` sets the profile or inline VLAN settings of every port that is not listed, " +
+					"except the device's current uplink and gateway WAN ports; it does not accept `name`. " +
+					"Point it at a locked-down profile (no native network, `tagged_vlan_mode = \"block_all\"`) to make a switch deny-by-default: " +
+					"only listed ports carry traffic. List the ports that feed other switches and access points explicitly: only the device's own uplink is skipped. " +
+					"Existing names on unlisted ports are kept. " +
+					"Removing `\"*\"`, or destroying the resource, releases the unlisted ports that still carry its settings back to the controller default.",
 				Required: true,
 				Validators: []validator.Map{
-					mapvalidator.KeysAre(stringvalidator.RegexMatches(portKeyRE, "must be a port number such as \"1\"")),
+					mapvalidator.KeysAre(stringvalidator.RegexMatches(portKeyRE, "must be a port number such as \"1\", or \"*\"")),
 				},
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
@@ -156,7 +152,7 @@ func (r *devicePortsResource) Schema(
 	}
 }
 
-var portKeyRE = regexp.MustCompile(`^[1-9][0-9]{0,8}$`)
+var portKeyRE = regexp.MustCompile(`^([1-9][0-9]{0,8}|\*)$`)
 
 func (r *devicePortsResource) Configure(
 	_ context.Context,
@@ -195,7 +191,7 @@ func (r *devicePortsResource) Create(
 		return
 	}
 	plan.Site = types.StringValue(r.client.SiteOrDefault(plan.Site))
-	id, err := r.write(ctx, plan.Site.ValueString(), plan.DeviceMAC.ValueString(), portWants(plan.Ports, nil), plan.DefaultPortProfileID.ValueString(), "")
+	id, err := r.write(ctx, plan.Site.ValueString(), plan.DeviceMAC.ValueString(), portWants(plan.Ports, nil), defaultWant(plan.Ports), nil)
 	if err != nil {
 		resp.Diagnostics.AddError("Error Assigning Device Ports", err.Error())
 		return
@@ -238,8 +234,9 @@ func (r *devicePortsResource) Read(
 		overrides, warnings = importableDevicePortOverrides(overrides)
 		resp.Diagnostics.Append(warnings...)
 	}
-	state.Ports = portsToModel(portsFromOverrides(overrides), state.Ports)
-	state.DefaultPortProfileID = observedDefaultProfile(d, state.Ports, state.DefaultPortProfileID)
+	prior := state.Ports
+	state.Ports = portsToModel(portsFromOverrides(overrides), prior)
+	observeDefaultPort(d, state.Ports, prior)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -261,7 +258,7 @@ func (r *devicePortsResource) Update(
 	}
 	plan.Site = state.Site
 	id, err := r.write(ctx, plan.Site.ValueString(), plan.DeviceMAC.ValueString(), portWants(plan.Ports, state.Ports),
-		plan.DefaultPortProfileID.ValueString(), state.DefaultPortProfileID.ValueString())
+		defaultWant(plan.Ports), defaultWant(state.Ports))
 	if err != nil {
 		resp.Diagnostics.AddError("Error Assigning Device Ports", err.Error())
 		return
@@ -283,7 +280,7 @@ func (r *devicePortsResource) Delete(
 		return
 	}
 
-	_, err := r.write(ctx, r.client.SiteOrDefault(state.Site), state.DeviceMAC.ValueString(), portWants(nil, state.Ports), "", state.DefaultPortProfileID.ValueString())
+	_, err := r.write(ctx, r.client.SiteOrDefault(state.Site), state.DeviceMAC.ValueString(), portWants(nil, state.Ports), nil, defaultWant(state.Ports))
 	var nf *unifi.NotFoundError
 	if err != nil && !errors.As(err, &nf) {
 		resp.Diagnostics.AddError("Error Releasing Device Ports", err.Error())
@@ -313,14 +310,14 @@ func (r *devicePortsResource) ImportState(
 
 // write merges want into the device's port_overrides and PUTs the result. It
 // returns the device ID.
-// defaultProfile is assigned to every eligible unlisted port; priorDefault is
-// the one being replaced or removed (see applyDefaultProfile).
-func (r *devicePortsResource) write(ctx context.Context, site, mac string, want map[int64]*portWant, defaultProfile, priorDefault string) (string, error) {
+// def is applied to every eligible unlisted port; prior is the default being
+// replaced or removed (see applyDefaultPort).
+func (r *devicePortsResource) write(ctx context.Context, site, mac string, want map[int64]*portWant, def, prior *portWant) (string, error) {
 	d, err := r.client.GetDevicePorts(ctx, site, mac)
 	if err != nil {
 		return "", fmt.Errorf("reading device %s: %w", mac, err)
 	}
-	applyDefaultProfile(d, want, defaultProfile, priorDefault)
+	applyDefaultPort(d, want, def, prior)
 	if len(want) == 0 {
 		return d.ID, nil
 	}
@@ -351,7 +348,7 @@ func (r *devicePortsResource) write(ctx context.Context, site, mac string, want 
 func portWants(planned, prior map[string]devicePortModel) map[int64]*portWant {
 	want := map[int64]*portWant{}
 	for k := range prior {
-		if idx, err := strconv.ParseInt(k, 10, 64); err == nil {
+		if idx, err := strconv.ParseInt(k, 10, 64); err == nil { // "*" is not a port
 			want[idx] = nil
 		}
 	}
@@ -387,7 +384,7 @@ func portsToModel(got map[int64]portWant, prior map[string]devicePortModel) map[
 		}
 	}
 	for k := range prior {
-		if _, ok := out[k]; !ok {
+		if _, ok := out[k]; !ok && k != defaultPortKey {
 			out[k] = devicePortModel{Name: types.StringNull(), PortProfileID: types.StringNull()}
 		}
 	}
@@ -421,10 +418,24 @@ func (r *devicePortsResource) ValidateConfig(ctx context.Context, req resource.V
 func validateDevicePortModels(ports map[string]devicePortModel) diag.Diagnostics {
 	var diags diag.Diagnostics
 	for key, p := range ports {
+		if key == defaultPortKey {
+			if p.Name.IsUnknown() {
+				continue
+			}
+			if !p.Name.IsNull() {
+				diags.AddAttributeError(path.Root("ports").AtMapKey(key), "Invalid Port Settings",
+					`The default port "*" does not accept name: it applies to every unlisted port, which keep their own names.`)
+			}
+		}
 		if p.PortProfileID.IsUnknown() || p.NativeNetworkID.IsUnknown() || p.TaggedVLANMode.IsUnknown() {
 			continue
 		}
 		native, mode := !p.NativeNetworkID.IsNull(), !p.TaggedVLANMode.IsNull()
+		if key == defaultPortKey && p.PortProfileID.IsNull() && !native && !mode {
+			diags.AddAttributeError(path.Root("ports").AtMapKey(key), "Invalid Port Settings",
+				`The default port "*" needs port_profile_id, or both native_network_id and tagged_vlan_mode.`)
+			continue
+		}
 		if (!p.PortProfileID.IsNull() && (native || mode)) || native != mode {
 			diags.AddAttributeError(path.Root("ports").AtMapKey(key), "Invalid Port Settings",
 				"Set either port_profile_id or both native_network_id and tagged_vlan_mode. A name alone is also allowed.")

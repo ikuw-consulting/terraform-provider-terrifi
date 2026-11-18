@@ -18,8 +18,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hashicorp/terraform-plugin-framework/types"
-
 	"github.com/alexklibisz/terrifi/internal/unifi"
 )
 
@@ -265,9 +263,20 @@ func (c *Client) listPortNetworks(ctx context.Context, site string) ([]unifi.Por
 	return resp.Data, nil
 }
 
-// defaultProfileEligible reports whether a port takes the default profile: not
+// defaultWant returns the settings of the reserved "*" port, or nil when the
+// ports map has none. The name is never part of it.
+func defaultWant(ports map[string]devicePortModel) *portWant {
+	p, ok := ports[defaultPortKey]
+	if !ok {
+		return nil
+	}
+	return &portWant{ProfileID: p.PortProfileID.ValueStringPointer(),
+		NativeNetworkID: p.NativeNetworkID.ValueStringPointer(), TaggedVLANMode: p.TaggedVLANMode.ValueStringPointer()}
+}
+
+// defaultPortEligible reports whether a port takes the default settings: not
 // the device's current uplink and, on a gateway, not a WAN interface.
-func defaultProfileEligible(d *unifi.DevicePorts, p unifi.DevicePort) bool {
+func defaultPortEligible(d *unifi.DevicePorts, p unifi.DevicePort) bool {
 	if p.IsUplink {
 		return false
 	}
@@ -279,26 +288,36 @@ func defaultProfileEligible(d *unifi.DevicePorts, p unifi.DevicePort) bool {
 	return true
 }
 
-// applyDefaultProfile adds the default profile's changes to want. Ports in want
+// carries reports whether a port's current settings are those of w.
+func carries(cur portWant, w *portWant) bool {
+	if w.ProfileID != nil {
+		return cur.ProfileID != nil && *cur.ProfileID == *w.ProfileID
+	}
+	return cur.ProfileID == nil && cur.NativeNetworkID != nil && w.NativeNetworkID != nil &&
+		*cur.NativeNetworkID == *w.NativeNetworkID &&
+		cur.TaggedVLANMode != nil && w.TaggedVLANMode != nil && *cur.TaggedVLANMode == *w.TaggedVLANMode
+}
+
+// applyDefaultPort adds the default settings' changes to want. Ports in want
 // with a non-nil entry are listed in the config and are never touched. Every
 // other eligible port:
 //
 //   - gets def, keeping its current name, when def is set. A port removed from
 //     the config (a nil entry) also loses its name, as it would on release;
-//   - is released (profile removed, name kept) when def is empty and the port
-//     still carries priorDef, so removing the default undoes only what it set.
-func applyDefaultProfile(d *unifi.DevicePorts, want map[int64]*portWant, def, priorDef string) {
-	if def == "" && priorDef == "" {
+//   - is released (settings removed, name kept) when def is nil and the port
+//     still carries prior, so removing the default undoes only what it set.
+func applyDefaultPort(d *unifi.DevicePorts, want map[int64]*portWant, def, prior *portWant) {
+	if def == nil && prior == nil {
 		return
 	}
 	current := portsFromOverrides(d.PortOverrides)
 	for _, p := range d.PortTable {
-		if want[p.PortIdx] != nil || !defaultProfileEligible(d, p) {
+		if want[p.PortIdx] != nil || !defaultPortEligible(d, p) {
 			continue
 		}
 		cur := current[p.PortIdx]
 		_, removed := want[p.PortIdx]
-		if removed && def == "" {
+		if removed && def == nil {
 			continue // already released outright
 		}
 		name := cur.Name
@@ -306,28 +325,33 @@ func applyDefaultProfile(d *unifi.DevicePorts, want map[int64]*portWant, def, pr
 			name = nil
 		}
 		switch {
-		case def != "":
-			want[p.PortIdx] = &portWant{ProfileID: &def, Name: name}
-		case cur.ProfileID != nil && *cur.ProfileID == priorDef:
-			want[p.PortIdx] = &portWant{Name: name}
+		case def != nil:
+			w := *def
+			w.Name = name
+			w.ResetVLAN = prior != nil && prior.NativeNetworkID != nil && def.NativeNetworkID == nil
+			want[p.PortIdx] = &w
+		case carries(cur, prior):
+			want[p.PortIdx] = &portWant{Name: name, ResetVLAN: prior.NativeNetworkID != nil}
 		}
 	}
 }
 
-// observedDefaultProfile reports def only while every eligible unlisted port
-// still carries it, so drift on any of them plans an update.
-func observedDefaultProfile(d *unifi.DevicePorts, listed map[string]devicePortModel, def types.String) types.String {
-	if def.IsNull() || def.IsUnknown() {
-		return def
+// observeDefaultPort keeps the "*" entry only while every eligible unlisted
+// port still carries it; otherwise it is blanked so the drift plans an update.
+func observeDefaultPort(d *unifi.DevicePorts, ports, prior map[string]devicePortModel) {
+	def := defaultWant(prior)
+	if def == nil {
+		return
 	}
 	current := portsFromOverrides(d.PortOverrides)
+	ports[defaultPortKey] = prior[defaultPortKey]
 	for _, p := range d.PortTable {
-		if _, ok := listed[strconv.FormatInt(p.PortIdx, 10)]; ok || !defaultProfileEligible(d, p) {
+		if _, ok := prior[strconv.FormatInt(p.PortIdx, 10)]; ok || !defaultPortEligible(d, p) {
 			continue
 		}
-		if cur := current[p.PortIdx]; cur.ProfileID == nil || *cur.ProfileID != def.ValueString() {
-			return types.StringNull()
+		if !carries(current[p.PortIdx], def) {
+			ports[defaultPortKey] = devicePortModel{}
+			return
 		}
 	}
-	return def
 }

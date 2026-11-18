@@ -221,20 +221,20 @@ func TestDevicePortsWrite(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	r := &devicePortsResource{client: newTestClient(t, srv.URL, false)}
-	id, err := r.write(t.Context(), "default", mac, map[int64]*portWant{3: {ProfileID: ptrTo(testProfileA)}}, "", "")
+	id, err := r.write(t.Context(), "default", mac, map[int64]*portWant{3: {ProfileID: ptrTo(testProfileA)}}, nil, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "000000000000000000000c02", id)
 	assert.Equal(t, []string{"port_overrides"}, slices.Collect(maps.Keys(putBody)))
 	assert.JSONEq(t, `[{"port_idx":3,"portconf_id":"`+testProfileA+`"},{"port_idx":5,"name":"desk","forward":"customize"}]`,
 		string(putBody["port_overrides"]))
 
-	_, err = r.write(t.Context(), "default", mac, map[int64]*portWant{7: {Name: ptrTo("x")}}, "", "")
+	_, err = r.write(t.Context(), "default", mac, map[int64]*portWant{7: {Name: ptrTo("x")}}, nil, nil)
 	assert.ErrorContains(t, err, "has no port 7")
 }
 
-// A default profile covers every eligible port that is not listed and keeps
-// the names already on those ports.
-func TestApplyDefaultProfile(t *testing.T) {
+// The "*" port covers every eligible port that is not listed and keeps the
+// names already on those ports.
+func TestApplyDefaultPort(t *testing.T) {
 	d := &unifi.DevicePorts{
 		PortTable: []unifi.DevicePort{
 			{PortIdx: 1, Ifname: "eth0"}, {PortIdx: 2, Ifname: "eth1"}, {PortIdx: 3, Ifname: "eth2"},
@@ -243,57 +243,106 @@ func TestApplyDefaultProfile(t *testing.T) {
 		EthernetOverrides: []unifi.EthernetOverride{{Ifname: "eth4", Networkgroup: "WAN"}},
 		PortOverrides:     overridesJSON(t, `[{"port_idx":2,"name":"desk","portconf_id":"old"},{"port_idx":3,"name":"tv","portconf_id":"prior"}]`),
 	}
-	const def, prior = "def", "prior"
+	def := &portWant{ProfileID: ptrTo("def")}
+	prior := &portWant{ProfileID: ptrTo("prior")}
 
 	t.Run("set", func(t *testing.T) {
 		want := map[int64]*portWant{1: {ProfileID: ptrTo("listed")}}
-		applyDefaultProfile(d, want, def, "")
+		applyDefaultPort(d, want, def, nil)
 		assert.Equal(t, map[int64]*portWant{
 			1: {ProfileID: ptrTo("listed")}, // listed ports are never touched
-			2: {ProfileID: ptrTo(def), Name: ptrTo("desk")},
-			3: {ProfileID: ptrTo(def), Name: ptrTo("tv")},
+			2: {ProfileID: ptrTo("def"), Name: ptrTo("desk")},
+			3: {ProfileID: ptrTo("def"), Name: ptrTo("tv")},
 			// port 4 is the uplink and port 5 is a WAN port: both skipped
 		}, want)
 	})
 
+	t.Run("inline VLAN settings", func(t *testing.T) {
+		inline := &portWant{NativeNetworkID: ptrTo("net"), TaggedVLANMode: ptrTo("block_all")}
+		want := map[int64]*portWant{}
+		applyDefaultPort(d, want, inline, &portWant{ProfileID: ptrTo("prior")})
+		assert.Equal(t, &portWant{NativeNetworkID: ptrTo("net"), TaggedVLANMode: ptrTo("block_all"), Name: ptrTo("desk")}, want[2])
+		// Moving from inline VLAN settings to a profile resets the VLAN keys;
+		// moving between inline settings overwrites them without a reset.
+		want = map[int64]*portWant{}
+		applyDefaultPort(d, want, def, &portWant{NativeNetworkID: ptrTo("net"), TaggedVLANMode: ptrTo("block_all")})
+		assert.True(t, want[2].ResetVLAN)
+		want = map[int64]*portWant{}
+		applyDefaultPort(d, want, inline, &portWant{NativeNetworkID: ptrTo("old"), TaggedVLANMode: ptrTo("allow_all")})
+		assert.False(t, want[2].ResetVLAN)
+	})
+
 	t.Run("removed port loses its name", func(t *testing.T) {
 		want := map[int64]*portWant{2: nil}
-		applyDefaultProfile(d, want, def, "")
-		assert.Equal(t, &portWant{ProfileID: ptrTo(def)}, want[2])
+		applyDefaultPort(d, want, def, nil)
+		assert.Equal(t, &portWant{ProfileID: ptrTo("def")}, want[2])
 	})
 
 	t.Run("remove releases only ports still on the prior default", func(t *testing.T) {
 		want := map[int64]*portWant{}
-		applyDefaultProfile(d, want, "", prior)
+		applyDefaultPort(d, want, nil, prior)
 		assert.Equal(t, map[int64]*portWant{3: {Name: ptrTo("tv")}}, want)
 	})
 
 	t.Run("remove leaves released ports released", func(t *testing.T) {
 		want := map[int64]*portWant{3: nil}
-		applyDefaultProfile(d, want, "", prior)
+		applyDefaultPort(d, want, nil, prior)
 		assert.Equal(t, map[int64]*portWant{3: nil}, want)
 	})
 
 	t.Run("no default is a no-op", func(t *testing.T) {
 		want := map[int64]*portWant{}
-		applyDefaultProfile(d, want, "", "")
+		applyDefaultPort(d, want, nil, nil)
 		assert.Empty(t, want)
 	})
 }
 
-func TestObservedDefaultProfile(t *testing.T) {
+func TestDefaultWant(t *testing.T) {
+	assert.Nil(t, defaultWant(map[string]devicePortModel{"1": {}}))
+	got := defaultWant(map[string]devicePortModel{"*": {PortProfileID: types.StringValue("p")}})
+	assert.Equal(t, &portWant{ProfileID: ptrTo("p")}, got)
+	// The reserved key is not a port: it never becomes a managed port entry.
+	assert.Empty(t, portWants(map[string]devicePortModel{"*": {PortProfileID: types.StringValue("p")}}, map[string]devicePortModel{"*": {}}))
+}
+
+func TestValidateDevicePortModels_defaultPort(t *testing.T) {
+	str := types.StringValue
+	assert.False(t, validateDevicePortModels(map[string]devicePortModel{"*": {PortProfileID: str("p"), Name: types.StringNull()}}).HasError())
+	assert.False(t, validateDevicePortModels(map[string]devicePortModel{"*": {NativeNetworkID: str("n"), TaggedVLANMode: str("block_all")}}).HasError())
+	assert.True(t, validateDevicePortModels(map[string]devicePortModel{"*": {PortProfileID: str("p"), Name: str("x")}}).HasError(), "name is rejected")
+	assert.True(t, validateDevicePortModels(map[string]devicePortModel{"*": {}}).HasError(), "an empty default is rejected")
+}
+
+func TestPortKeyRE(t *testing.T) {
+	for _, k := range []string{"1", "24", "*"} {
+		assert.True(t, portKeyRE.MatchString(k), k)
+	}
+	for _, k := range []string{"", "0", "**", "*1", "a", "default", "1*"} {
+		assert.False(t, portKeyRE.MatchString(k), k)
+	}
+}
+
+func TestObserveDefaultPort(t *testing.T) {
 	d := &unifi.DevicePorts{
 		PortTable:     []unifi.DevicePort{{PortIdx: 1}, {PortIdx: 2}, {PortIdx: 3, IsUplink: true}},
 		PortOverrides: overridesJSON(t, `[{"port_idx":1,"portconf_id":"def"},{"port_idx":2,"portconf_id":"def"}]`),
 	}
-	def := types.StringValue("def")
-	assert.Equal(t, def, observedDefaultProfile(d, nil, def))
-	assert.True(t, observedDefaultProfile(d, nil, types.StringNull()).IsNull())
+	def := devicePortModel{PortProfileID: types.StringValue("def")}
+	run := func(prior map[string]devicePortModel) map[string]devicePortModel {
+		out := map[string]devicePortModel{}
+		for k, v := range prior {
+			out[k] = v
+		}
+		observeDefaultPort(d, out, prior)
+		return out
+	}
+	assert.Equal(t, def, run(map[string]devicePortModel{"*": def})["*"])
+	assert.NotContains(t, run(map[string]devicePortModel{"1": {}}), "*")
 
 	// A listed port is not the default's business; an unlisted one that drifted is.
 	d.PortOverrides = overridesJSON(t, `[{"port_idx":1,"portconf_id":"other"}]`)
-	assert.Equal(t, def, observedDefaultProfile(d, map[string]devicePortModel{"1": {}, "2": {}}, def))
-	assert.True(t, observedDefaultProfile(d, map[string]devicePortModel{"1": {}}, def).IsNull())
+	assert.Equal(t, def, run(map[string]devicePortModel{"*": def, "1": {}, "2": {}})["*"])
+	assert.True(t, run(map[string]devicePortModel{"*": def, "1": {}})["*"].PortProfileID.IsNull())
 }
 
 func TestDevicePortsWrite_defaultProfile(t *testing.T) {
@@ -312,7 +361,7 @@ func TestDevicePortsWrite_defaultProfile(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	r := &devicePortsResource{client: newTestClient(t, srv.URL, false)}
-	_, err := r.write(t.Context(), "default", mac, map[int64]*portWant{1: {ProfileID: ptrTo(testProfileA)}}, testProfileB, "")
+	_, err := r.write(t.Context(), "default", mac, map[int64]*portWant{1: {ProfileID: ptrTo(testProfileA)}}, &portWant{ProfileID: ptrTo(testProfileB)}, nil)
 	require.NoError(t, err)
 	assert.JSONEq(t, `[{"port_idx":1,"portconf_id":"`+testProfileA+`"},{"port_idx":2,"name":"desk","portconf_id":"`+testProfileB+`"}]`,
 		string(putBody["port_overrides"]))
@@ -925,7 +974,7 @@ func (tg devicePortsTarget) checkDefaultProfile(s *terraform.State) error {
 	want := s.RootModule().Resources["terrifi_port_profile.b"].Primary.ID
 	current := portsFromOverrides(d.PortOverrides)
 	for _, p := range d.PortTable {
-		if p.PortIdx == tg.p1 || !defaultProfileEligible(d, p) {
+		if p.PortIdx == tg.p1 || !defaultPortEligible(d, p) {
 			continue
 		}
 		if got := current[p.PortIdx].ProfileID; got == nil || *got != want {
@@ -944,15 +993,14 @@ func TestAccDevicePorts_defaultProfile(t *testing.T) {
 	listed := fmt.Sprintf(`
     %q = { name = "tfacc-dp-%s", port_profile_id = terrifi_port_profile.a.id }`, tg.k1(), suffix)
 	withDefault := func(profile string) string {
-		return strings.Replace(testAccDevicePortsConfig(tg, suffix, listed), "  ports = {",
-			"  default_port_profile_id = terrifi_port_profile."+profile+".id\n  ports = {", 1)
+		return testAccDevicePortsConfig(tg, suffix, listed+"\n    \"*\" = { port_profile_id = terrifi_port_profile."+profile+".id }")
 	}
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             tg.checkDestroy,
 		Steps: []resource.TestStep{
 			{Config: withDefault("b"), Check: resource.ComposeAggregateTestCheckFunc(
-				resource.TestCheckResourceAttrPair(testAccDevicePortsAddr, "default_port_profile_id", "terrifi_port_profile.b", "id"),
+				resource.TestCheckResourceAttrPair(testAccDevicePortsAddr, "ports.*.port_profile_id", "terrifi_port_profile.b", "id"),
 				tg.checkPort(tg.p1, "tfacc-dp-"+suffix, "terrifi_port_profile.a", true),
 				tg.checkDefaultProfile,
 			)},
@@ -967,11 +1015,11 @@ func TestAccDevicePorts_defaultProfile(t *testing.T) {
 			},
 			// Moving to a different profile re-points every unlisted port.
 			{Config: withDefault("a"), Check: resource.ComposeAggregateTestCheckFunc(
-				resource.TestCheckResourceAttrPair(testAccDevicePortsAddr, "default_port_profile_id", "terrifi_port_profile.a", "id"),
+				resource.TestCheckResourceAttrPair(testAccDevicePortsAddr, "ports.*.port_profile_id", "terrifi_port_profile.a", "id"),
 			)},
 			// Removing the default releases every port it set.
 			{Config: testAccDevicePortsConfig(tg, suffix, listed), Check: resource.ComposeAggregateTestCheckFunc(
-				resource.TestCheckNoResourceAttr(testAccDevicePortsAddr, "default_port_profile_id"),
+				resource.TestCheckNoResourceAttr(testAccDevicePortsAddr, "ports.*.port_profile_id"),
 				tg.checkOtherPorts,
 			)},
 		},
