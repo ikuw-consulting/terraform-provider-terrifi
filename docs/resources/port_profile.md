@@ -161,8 +161,8 @@ See [validation coverage](../guides/validation-coverage.md) for definitions and 
 | `stp_enabled` | Omit to reset to `true` | ✅ | ✅ |
 | `bpdu_guard_enabled` | Set to `true` | ✅ | ✅ |
 | `bpdu_guard_enabled` | Omit to reset to `false` | ✅ | ✅ |
-| `port_mode` | Set to `edge` and `infrastructure` | ✅ | ❌ |
-| `port_mode` | Omit to leave the controller's value untouched | ✅ | ❌ |
+| `port_mode` | Set to `edge` and `infrastructure` | ❌ | ❌ |
+| `port_mode` | Omit to leave the controller's value untouched | ❌ | ❌ |
 | `loop_protection_enabled` | Set to `true` | ✅ | ✅ |
 | `loop_protection_enabled` | Omit to reset to `false` | ✅ | ✅ |
 | `storm_control_type` | Change between percentage and packets per second | ✅ | ✅ |
